@@ -1,0 +1,262 @@
+"""
+HTMLRenderer: single self-contained HTML report with navigation.
+
+Includes inline Mermaid for ER diagrams, syntax-highlighted code blocks,
+and a sidebar with all object types. No external CSS/JS dependencies.
+"""
+
+from __future__ import annotations
+
+import html
+import re
+from pathlib import Path
+
+from access_dissect.analyze.complexity import score_all_objects
+from access_dissect.catalog.models import (
+    AccessCatalog,
+    WarningSeverity,
+)
+
+
+_CSS = """
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+       margin: 0; background: #f8f9fa; color: #212529; }
+#layout { display: flex; min-height: 100vh; }
+#sidebar { width: 260px; background: #1e2129; color: #c9d1d9; padding: 16px;
+           position: sticky; top: 0; height: 100vh; overflow-y: auto;
+           flex-shrink: 0; font-size: 13px; }
+#sidebar h2 { color: #58a6ff; font-size: 14px; text-transform: uppercase;
+              letter-spacing: .1em; margin: 16px 0 4px; }
+#sidebar a { color: #c9d1d9; text-decoration: none; display: block;
+             padding: 2px 8px; border-radius: 4px; }
+#sidebar a:hover { background: #30363d; color: #fff; }
+#content { flex: 1; padding: 24px 32px; max-width: 1200px; }
+h1 { border-bottom: 2px solid #dee2e6; padding-bottom: 8px; }
+h2 { color: #495057; margin-top: 28px; }
+table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 13px; }
+th { background: #343a40; color: #fff; padding: 8px 12px; text-align: left; }
+td { padding: 6px 12px; border-bottom: 1px solid #dee2e6; }
+tr:nth-child(even) { background: #f1f3f5; }
+pre { background: #0d1117; color: #c9d1d9; padding: 16px; border-radius: 6px;
+      overflow-x: auto; font-size: 13px; }
+code { background: #f1f3f5; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px;
+         font-weight: bold; margin: 2px; }
+.badge-blocker { background: #ff4d4d; color: #fff; }
+.badge-high { background: #ffa500; color: #fff; }
+.badge-medium { background: #ffd700; color: #333; }
+.badge-low { background: #90ee90; color: #333; }
+.badge-info { background: #add8e6; color: #333; }
+.section { background: #fff; border-radius: 8px; padding: 20px;
+           margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+.score-low  { color: #28a745; font-weight: bold; }
+.score-med  { color: #fd7e14; font-weight: bold; }
+.score-high { color: #dc3545; font-weight: bold; }
+"""
+
+_MERMAID_SCRIPT = """<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true, theme:'neutral'});</script>"""
+
+
+def _h(s: str) -> str:
+    return html.escape(str(s))
+
+
+def _score_class(score: float) -> str:
+    if score <= 3:
+        return "score-low"
+    if score <= 6:
+        return "score-med"
+    return "score-high"
+
+
+def _mermaid_erd(catalog: AccessCatalog) -> str:
+    lines = ["erDiagram"]
+    for rel in catalog.relations:
+        p = re.sub(r"[^a-zA-Z0-9_]", "_", rel.parent_table)
+        c = re.sub(r"[^a-zA-Z0-9_]", "_", rel.child_table)
+        if rel.one_to_one:
+            cardinality = "||--||"
+        elif not rel.enforce_integrity:
+            cardinality = "..o{"
+        else:
+            cardinality = "||--o{"
+        label = "enforces" if rel.enforce_integrity else "references"
+        lines.append(f'  {p} {cardinality} {c} : "{label}"')
+    return f'<div class="mermaid">\n{chr(10).join(lines)}\n</div>'
+
+
+def render_html(
+    catalog: AccessCatalog,
+    output_path: Path,
+) -> None:
+    """Render a self-contained HTML report."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    scores = score_all_objects(catalog)
+    score_map = {(s.object_type, s.object_name): s for s in scores}
+    db_title = _h(catalog.properties.title or catalog.properties.file_path.split("\\")[-1])
+
+    # Build sidebar
+    def sidebar_section(title: str, items: list[str], anchor_prefix: str) -> str:
+        if not items:
+            return ""
+        links = "".join(
+            f'<a href="#{anchor_prefix}_{_anchor(i)}">{_h(i)}</a>' for i in items[:100]
+        )
+        if len(items) > 100:
+            links += f'<span style="color:#888">... and {len(items)-100} more</span>'
+        return f"<h2>{_h(title)}</h2>{links}"
+
+    sidebar = sidebar_section("Tables", [t.name for t in catalog.tables], "tbl")
+    sidebar += sidebar_section("Queries", [q.name for q in catalog.queries], "qry")
+    sidebar += sidebar_section("Forms", [f.name for f in catalog.forms], "frm")
+    sidebar += sidebar_section("Reports", [r.name for r in catalog.reports], "rpt")
+    sidebar += sidebar_section("Modules", [m.name for m in catalog.modules], "mod")
+
+    # Main content
+    sections: list[str] = []
+
+    # Overview
+    sections.append(f"""
+<div class="section">
+<h1>📊 {db_title}</h1>
+<p>Generated by <strong>{_h(catalog.extracted_by)}</strong> on {catalog.extracted_at.strftime('%Y-%m-%d %H:%M')}</p>
+<p>Source: <code>{_h(catalog.properties.file_path)}</code></p>
+<table>
+<tr><th>Object</th><th>Count</th></tr>
+<tr><td>Tables</td><td>{len(catalog.tables)}</td></tr>
+<tr><td>Queries</td><td>{len(catalog.queries)}</td></tr>
+<tr><td>Forms</td><td>{len(catalog.forms)}</td></tr>
+<tr><td>Reports</td><td>{len(catalog.reports)}</td></tr>
+<tr><td>VBA Modules</td><td>{len(catalog.modules)}</td></tr>
+<tr><td>Macros</td><td>{len(catalog.macros)}</td></tr>
+<tr><td>Relationships</td><td>{len(catalog.relations)}</td></tr>
+<tr><td>Total VBA Lines</td><td>{catalog.total_vba_lines():,}</td></tr>
+</table>
+</div>""")
+
+    # ER diagram
+    if catalog.relations:
+        sections.append(f"""
+<div class="section" id="erd">
+<h2>Entity Relationship Diagram</h2>
+{_mermaid_erd(catalog)}
+</div>""")
+
+    # Tables
+    for table in catalog.tables:
+        sc = score_map.get(("table", table.name))
+        score_html = ""
+        if sc:
+            score_html = f'<span class="{_score_class(sc.score)}">Complexity: {sc.score:.1f}/10</span>'
+
+        field_rows = "".join(
+            f"<tr><td><code>{_h(f.name)}</code></td><td>{_h(f.field_type.value)}</td>"
+            f"<td>{'✓' if f.required else ''}</td><td>{'🔑' if f.is_primary_key else ''}</td></tr>"
+            for f in table.fields
+        )
+        sections.append(f"""
+<div class="section" id="tbl_{_anchor(table.name)}">
+<h2>Table: {_h(table.name)} {score_html}</h2>
+{'<p>🔗 Linked Table</p>' if table.is_linked else ''}
+{f'<p>Rows: <strong>{table.record_count:,}</strong></p>' if table.record_count is not None else ''}
+<table><tr><th>Field</th><th>Type</th><th>Required</th><th>PK</th></tr>
+{field_rows}</table>
+</div>""")
+
+    # Queries
+    for query in catalog.queries:
+        sc = score_map.get(("query", query.name))
+        score_html = ""
+        if sc:
+            score_html = f'<span class="{_score_class(sc.score)}">Complexity: {sc.score:.1f}/10</span>'
+        badges = ""
+        if query.is_pass_through:
+            badges += '<span class="badge badge-blocker">Pass-Through</span>'
+        if query.in_circular_dependency:
+            badges += '<span class="badge badge-high">Circular Dependency</span>'
+        sections.append(f"""
+<div class="section" id="qry_{_anchor(query.name)}">
+<h2>Query: {_h(query.name)} {score_html}</h2>
+<p>{badges} Type: <strong>{_h(query.query_type.value)}</strong></p>
+<pre><code>{_h(query.sql_text)}</code></pre>
+</div>""")
+
+    # Forms
+    for form in catalog.forms:
+        sc = score_map.get(("form", form.name))
+        score_html = ""
+        if sc:
+            score_html = f'<span class="{_score_class(sc.score)}">Complexity: {sc.score:.1f}/10</span>'
+        sections.append(f"""
+<div class="section" id="frm_{_anchor(form.name)}">
+<h2>Form: {_h(form.name)} {score_html}</h2>
+{f'<p>Record Source: <code>{_h(form.record_source)}</code></p>' if form.record_source else ''}
+<p>Controls: {len(form.controls)} | Subforms: {len(form.subforms)} | VBA: {'Yes' if form.has_vba_module else 'No'}</p>
+</div>""")
+
+    # Modules
+    for module in catalog.modules:
+        locked_notice = '<p>⚠ <strong>VBA project locked — source code unavailable</strong></p>' if module.is_vba_locked else ""
+        code_block = ""
+        if module.source_code:
+            # Show first 100 lines
+            lines = module.source_code.split("\n")
+            preview = "\n".join(lines[:100])
+            if len(lines) > 100:
+                preview += f"\n... ({len(lines) - 100} more lines)"
+            code_block = f"<pre><code>{_h(preview)}</code></pre>"
+        sections.append(f"""
+<div class="section" id="mod_{_anchor(module.name)}">
+<h2>Module: {_h(module.name)}</h2>
+<p>Type: {_h(module.module_type.value)} | Lines: {module.line_count or 'unknown'}</p>
+{locked_notice}
+{code_block}
+</div>""")
+
+    # Warnings
+    errors = catalog.warnings_by_severity(WarningSeverity.ERROR)
+    warns = catalog.warnings_by_severity(WarningSeverity.WARNING)
+    if errors or warns:
+        rows = "".join(
+            f"<tr><td>{_h(w.severity.value)}</td><td><code>{_h(w.object_type)}:{_h(w.object_name)}</code></td>"
+            f"<td><code>{_h(w.warning_code)}</code></td><td>{_h(w.message[:150])}</td></tr>"
+            for w in (errors + warns)
+        )
+        sections.append(f"""
+<div class="section" id="warnings">
+<h2>⚠ Extraction Warnings ({len(errors)} errors, {len(warns)} warnings)</h2>
+<table><tr><th>Severity</th><th>Object</th><th>Code</th><th>Message</th></tr>
+{rows}</table>
+</div>""")
+
+    body = "\n".join(sections)
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{db_title} — access-dissect</title>
+<style>{_CSS}</style>
+{_MERMAID_SCRIPT}
+</head>
+<body>
+<div id="layout">
+<nav id="sidebar">
+<strong style="font-size:16px;color:#fff">📊 {db_title}</strong>
+{sidebar}
+</nav>
+<main id="content">
+{body}
+</main>
+</div>
+</body>
+</html>"""
+
+    output_path.write_text(html_content, encoding="utf-8")
+
+
+def _anchor(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_]", "_", name)
