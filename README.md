@@ -75,3 +75,7 @@ access-dissect analyze myapp_catalog.json
 ## Architecture
 
 See the [plan file](../.claude/plans/create-a-plan-for-playful-panda.md) for the full architectural design.
+
+## License
+
+[MIT](LICENSE)
